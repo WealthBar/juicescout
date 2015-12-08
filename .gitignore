@@ -1,0 +1,11 @@
+# Just Mac things
+.DS_Store
+
+# dotenv
+.env
+
+# The actual data
+data/*
+
+# Binaries
+juicescout
