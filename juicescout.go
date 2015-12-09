@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"time"
 
 	"os"
 	"path"
@@ -17,7 +18,7 @@ import (
 	"github.com/parnurzeal/gorequest"
 )
 
-var categoriesPath, scoutAPI, collectionID string
+var categoriesPath, questionsPath, answersPath, scoutAPI, helpjuiceName, collectionID string
 
 // Category is imported from HelpJuice's exported CSV
 type Category struct {
@@ -31,6 +32,27 @@ type CategoryMapping struct {
 	juiceID int    // HelpJuice Category ID
 	scoutID string // HelpScout Category ID
 	name    string // Category name
+}
+
+// Question is imported from HelpJuice's exported CSV
+type Question struct {
+	name     string // HelpJuice Question Name
+	category int    // HelpJuice Question Category
+	id       int    // HelpJuice Question ID
+	views    int    // HelpJuice Question Number of views
+}
+
+// Answer is imported from HelpJuice's exported CSV
+type Answer struct {
+	question int    // HelpJuice Answer ID
+	body     string // HelpJuice Answer Body
+}
+
+// Article stores information required to create an article on HelpScout
+type Article struct {
+	name       string   // Article name
+	text       string   // Content of the article
+	categories []string // An array of Category IDs that this article should be associated with
 }
 
 func errorCheck(e error) {
@@ -49,16 +71,12 @@ func errsCheck(errs []error) {
 }
 
 func checkAPIError(APIError string) {
-	parsed, err := jason.NewObjectFromBytes([]byte(APIError))
-	errorCheck(err)
-	parsedName, err := parsed.GetStringArray("name")
-	errorCheck(err)
-	fmt.Println(parsedName[0])
+	fmt.Println(APIError)
 }
 
 // Parse the provided categories CSV
-func parseCategories() [][]string {
-	filePath := path.Clean(categoriesPath)
+func parseCSV(csvPath string) [][]string {
+	filePath := path.Clean(csvPath)
 	f, err := ioutil.ReadFile(filePath)
 	errorCheck(err)
 
@@ -80,6 +98,7 @@ func processCategories(categories [][]string) []Category {
 		if index == 0 {
 			continue
 		}
+
 		id, _ := strconv.Atoi(category[0])
 		parent, _ := strconv.Atoi(category[1])
 		name := category[2]
@@ -90,7 +109,91 @@ func processCategories(categories [][]string) []Category {
 	return processedCategories
 }
 
-func migrateCategories(categories []Category) []CategoryMapping {
+func processQuestions(questions [][]string) []Question {
+	processedQuestions := []Question{}
+	for index, question := range questions {
+		// Skip the header column
+		if index == 0 {
+			continue
+		}
+
+		name := question[0]
+		category, _ := strconv.Atoi(question[1])
+		id, _ := strconv.Atoi(question[2])
+		views, _ := strconv.Atoi(question[3])
+		processedQuestions = append(processedQuestions, Question{name, category, id, views})
+
+		fmt.Println("Processed questions: ", name)
+	}
+
+	return processedQuestions
+}
+
+func processAnswers(answers [][]string) []Answer {
+	processedAnswers := []Answer{}
+	for index, answer := range answers {
+		// Skip the header column
+		if index == 0 {
+			continue
+		}
+
+		question, _ := strconv.Atoi(answer[0])
+		body := answer[1]
+		processedAnswers = append(processedAnswers, Answer{question, body})
+
+		fmt.Println("Processed answers: ", question)
+	}
+
+	return processedAnswers
+}
+
+func processArticles(categoryMappings []CategoryMapping, questions []Question, answers []Answer) []Article {
+	articles := []Article{}
+	for _, question := range questions {
+		// Find the body
+		var questionBody string
+		for _, answer := range answers {
+			if answer.question == question.id {
+				questionBody = answer.body
+				break
+			}
+		}
+
+		var questionCategory []string
+		for _, categoryMapping := range categoryMappings {
+			if categoryMapping.juiceID == question.category {
+				questionCategory = append(questionCategory, categoryMapping.scoutID)
+				questionCategory[0] = categoryMapping.scoutID
+				break
+			}
+		}
+
+		articles = append(articles, Article{question.name, questionBody, questionCategory})
+	}
+
+	fmt.Println("Processed articles!")
+	return articles
+}
+
+func createOnScout(object string, resource string, name string) (int, string) {
+	// _ = "breakpoint"
+	request := gorequest.New().SetBasicAuth(scoutAPI, "X")
+	resp, body, errs := request.
+		Post("https://docsapi.helpscout.net/v1/" + resource).
+		Send(object).
+		End()
+	errsCheck(errs)
+
+	if resp.StatusCode != 201 {
+		checkAPIError(body)
+	} else {
+		fmt.Println("Success! ", name, " has been created on HelpScout.")
+	}
+
+	return resp.StatusCode, body
+}
+
+func migrateCategories(categories []Category) ([]CategoryMapping, string) {
 	request := gorequest.New().SetBasicAuth(scoutAPI, "X")
 
 	// Get collections to find collection id
@@ -112,17 +215,7 @@ func migrateCategories(categories []Category) []CategoryMapping {
 	// Create the categories
 	for _, category := range categories {
 		categoryObject := `{"collectionId": "` + collectionID + `", "name": "` + category.name + `"}`
-		resp, categoryBody, errs := request.
-			Post("https://docsapi.helpscout.net/v1/categories").
-			Send(categoryObject).
-			End()
-		errsCheck(errs)
-
-		if resp.StatusCode != 201 {
-			checkAPIError(categoryBody)
-		} else {
-			fmt.Println("Success! ", category.name, " has been created on HelpScout.")
-		}
+		createOnScout(categoryObject, "categories", category.name)
 	}
 
 	// Link HelpScout and HelpJuice category IDs
@@ -156,11 +249,32 @@ func migrateCategories(categories []Category) []CategoryMapping {
 		checkAPIError(categoryListBody)
 	}
 
-	return categoryMappings
+	return categoryMappings, collectionID
 }
 
-func migrateQuestions(categoryMappings []CategoryMapping) {
-	fmt.Println(categoryMappings)
+func migrateArticles(articles []Article, collectionID string) {
+	for _, article := range articles {
+		articleName := strings.Replace(article.name, "\n", "</br>", -1)
+		articleName = strconv.Quote(articleName)
+		articleObject := `{"collectionId": "` + collectionID + `", "name": "` + articleName + `", "categories": [`
+		articleCategories := ""
+		for index, category := range article.categories {
+			articleCategories = articleCategories + `"` + category + `"`
+			if index != (len(article.categories) - 1) {
+				articleCategories = articleCategories + ", "
+			}
+		}
+		articleText := strings.Replace(article.text, "\n", "<br>", -1)
+		articleText = strconv.Quote(articleText)
+
+		articleObject = articleObject + articleCategories + `], "text": ` + articleText + `}`
+
+		statusCode, respBody := createOnScout(articleObject, "articles", article.name)
+		if statusCode == 400 && (respBody == `{"code":400,"error":"Invalid Json"}` || respBody == `{"code":400,"error":"Content-Type must be set to 'application/json'"}`) {
+			fmt.Println(articleObject)
+			log.Fatalln("Danger!")
+		}
+	}
 }
 
 func main() {
@@ -178,7 +292,25 @@ func main() {
 		cli.StringFlag{
 			Name:        "categoriesPath, c",
 			Usage:       "Path of the HelpJuice categories.csv file",
+			EnvVar:      "CATEGORIES_PATH",
 			Destination: &categoriesPath,
+		},
+		cli.StringFlag{
+			Name:        "questionsPath, q",
+			Usage:       "Path of the HelpJuice questions.csv file",
+			EnvVar:      "QUESTIONS_PATH",
+			Destination: &questionsPath,
+		},
+		cli.StringFlag{
+			Name:        "answersPath, a",
+			Usage:       "Path of the HelpJuice answers.csv file",
+			EnvVar:      "ANSWERS_PATH",
+			Destination: &answersPath,
+		},
+		cli.StringFlag{
+			Name:        "helpjuiceName, j",
+			Usage:       "Name of the HelpJuice",
+			Destination: &helpjuiceName,
 		},
 		cli.StringFlag{
 			Name:        "scoutAPI, s",
@@ -190,15 +322,25 @@ func main() {
 
 	app.Action = func(c *cli.Context) {
 		// Required flag warning
-		if categoriesPath == "" {
-			log.Fatalln("categoriesPath flag is required")
+		if helpjuiceName == "" {
+			log.Fatalln("Missing helpjuiceName flag is required")
 		}
 
-		categories := parseCategories()
+		fmt.Println("Beginning migration!")
+		start := time.Now()
+		categories := parseCSV(categoriesPath)
 		processedCategories := processCategories(categories)
-		categoryMappings := migrateCategories(processedCategories)
-		migrateQuestions(categoryMappings)
-		// migrateAnswers
+		categoryMappings, collectionID := migrateCategories(processedCategories)
+		questions := parseCSV(questionsPath)
+		processedQuestions := processQuestions(questions)
+		answers := parseCSV(answersPath)
+		processedAnswers := processAnswers(answers)
+		processedArticles := processArticles(categoryMappings, processedQuestions, processedAnswers)
+		migrateArticles(processedArticles, collectionID)
+		end := time.Now()
+		fmt.Println("Done!")
+		fmt.Print("Took ")
+		fmt.Print(end.Sub(start))
 	}
 
 	app.Run(os.Args)
